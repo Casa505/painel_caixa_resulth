@@ -14,6 +14,15 @@ function brMoney($value): string
     return number_format((float)$value, 2, ',', '.');
 }
 
+function dataCurta($valor): string
+{
+    $texto = trim((string)$valor);
+    if (preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $texto, $partes)) {
+        return $partes[3] . '-' . $partes[2] . '-' . $partes[1];
+    }
+    return $texto;
+}
+
 function validarData(string $data): bool
 {
     $d = DateTime::createFromFormat('Y-m-d', $data);
@@ -45,8 +54,8 @@ function adicionarFiltroCliente(string &$sql, array &$params, string $aliasPedid
 }
 
 $hoje = date('Y-m-d');
-$dataIni = $_GET['data_ini'] ?? $hoje;
-$dataFim = $_GET['data_fim'] ?? $hoje;
+$dataIni = (string)($_GET['data'] ?? $_GET['data_ini'] ?? $hoje);
+$dataFim = $dataIni; // Consulta de um único dia; fim exclusivo calculado adiante.
 $empresa = trim((string)($_GET['empresa'] ?? $config['empresa']));
 $usuario = trim((string)($_GET['usuario'] ?? ''));
 $tipo = strtoupper(trim((string)($_GET['tipo'] ?? '')));
@@ -87,10 +96,8 @@ $totais = [
     'BANCO' => 0.0,
 ];
 
-if (!validarData($dataIni) || !validarData($dataFim)) {
-    $erro = 'Informe datas válidas.';
-} elseif ($dataIni > $dataFim) {
-    $erro = 'A data inicial não pode ser maior que a data final.';
+if (!validarData($dataIni)) {
+    $erro = 'Informe uma data válida.';
 }
 
 if ($erro === null) {
@@ -172,12 +179,28 @@ SELECT
           AND CA.CODEMPRESA = P.CODEMPRESA
     ), 0) AS CARTAO,
 
-    COALESCE((
-        SELECT SUM(R.VALOR)
-        FROM DAVPV_RECEBER R
-        WHERE R.ID_DAVPV = P.ID_DAVPV
-          AND R.CODEMPRESA = P.CODEMPRESA
-    ), 0) AS RECEBER,
+    -- Prioriza recebimento convencional quando existente; caso contrario,
+    -- utiliza as parcelas manuais, evitando contar duas vezes o mesmo titulo.
+    CASE
+        WHEN COALESCE((
+            SELECT SUM(R.VALOR)
+            FROM DAVPV_RECEBER R
+            WHERE R.ID_DAVPV = P.ID_DAVPV
+              AND R.CODEMPRESA = P.CODEMPRESA
+        ), 0) > 0
+        THEN COALESCE((
+            SELECT SUM(R.VALOR)
+            FROM DAVPV_RECEBER R
+            WHERE R.ID_DAVPV = P.ID_DAVPV
+              AND R.CODEMPRESA = P.CODEMPRESA
+        ), 0)
+        ELSE COALESCE((
+            SELECT M.VALORRECEBER
+            FROM DAVPV_RECEBERMANUALCAB M
+            WHERE M.ID_DAVPV = P.ID_DAVPV
+              AND M.CODEMPRESA = P.CODEMPRESA
+        ), 0)
+    END AS RECEBER,
 
     COALESCE((
         SELECT SUM(CH.VLRCHEQUE)
@@ -517,7 +540,7 @@ SQL;
 
         // Exportação CSV do mesmo resultado filtrado.
         if (($_GET['export'] ?? '') === 'csv') {
-            $nome = 'caixa_' . $dataIni . '_a_' . $dataFim . '.csv';
+            $nome = 'caixa_' . $dataIni . '.csv';
             header('Content-Type: text/csv; charset=UTF-8');
             header('Content-Disposition: attachment; filename="' . $nome . '"');
             echo "\xEF\xBB\xBF";
@@ -531,7 +554,7 @@ SQL;
 
             foreach ($rows as $row) {
                 fputcsv($out, [
-                    $row['DATA'],
+                    dataCurta($row['DATA']),
                     $row['TIPO'],
                     $row['CODIGO'],
                     $row['CODCLIENTE'],
@@ -558,6 +581,8 @@ SQL;
 }
 
 $queryExport = $_GET;
+unset($queryExport['data_ini'], $queryExport['data_fim']);
+$queryExport['data'] = $dataIni;
 $queryExport['export'] = 'csv';
 $urlExport = '?' . http_build_query($queryExport);
 ?>
@@ -668,6 +693,25 @@ $urlExport = '?' . http_build_query($queryExport);
             gap: 8px;
         }
 
+        /* Ações de exportação/impressão à direita do título */
+        .header-tools {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-left: auto;
+        }
+        .header-tools .btn {
+            width: auto;
+            min-width: 145px;
+            white-space: nowrap;
+        }
+        @media (max-width: 650px) {
+            .header-tools { margin-left: 0; width: 100%; justify-content: flex-start; }
+            .header-tools .btn { flex: 1; min-width: 120px; }
+        }
+
         .totals {
             display: grid;
             grid-template-columns: repeat(8, minmax(130px, 1fr));
@@ -704,6 +748,7 @@ $urlExport = '?' . http_build_query($queryExport);
             width: 100%;
             border-collapse: collapse;
             min-width: 1350px;
+            table-layout: fixed;
             font-size: 13px;
         }
 
@@ -722,6 +767,35 @@ $urlExport = '?' . http_build_query($queryExport);
             font-size: 12px;
         }
 
+        /* Impede que textos longos invadam a coluna vizinha ao redimensionar. */
+        #tabela-caixa { min-width: 0; }
+        #tabela-caixa th,
+        #tabela-caixa td {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 0;
+        }
+        #tabela-caixa th { position: sticky; }
+        #tabela-caixa .sort-button {
+            max-width: calc(100% - 8px);
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+        #tabela-caixa .col-resizer {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 8px;
+            height: 100%;
+            cursor: col-resize;
+            touch-action: none;
+            user-select: none;
+            z-index: 4;
+        }
+        #tabela-caixa .col-resizer:hover { background: rgba(181, 31, 31, .28); }
+        body.col-resizing, body.col-resizing * { cursor: col-resize !important; user-select: none !important; }
         .sort-button {
             display: inline-flex;
             align-items: center;
@@ -807,6 +881,7 @@ $urlExport = '?' . http_build_query($queryExport);
                 font-size: 10px;
             }
 
+            #tabela-caixa { width: 100% !important; }
             .container {
                 width: 100%;
                 margin: 0;
@@ -885,9 +960,14 @@ $urlExport = '?' . http_build_query($queryExport);
 
             table {
                 min-width: 0;
-                width: 100%;
+                width: 100% !important;
+                table-layout: auto;
                 font-size: 8px;
             }
+            #tabela-caixa col { width: auto !important; }
+            #tabela-caixa .col-resizer { display: none !important; }
+            #tabela-caixa { min-width: 0; }
+            #tabela-caixa th, #tabela-caixa td { max-width: none; overflow: visible; text-overflow: clip; }
 
             th, td {
                 border: 1px solid #999;
@@ -927,18 +1007,24 @@ $urlExport = '?' . http_build_query($queryExport);
             <h1>Consulta de Caixa</h1>
             <small>Vendas faturadas + recebimentos</small>
         </div>
+        <?php if ($erro === null): ?>
+        <div class="header-tools no-print">
+            <a class="btn btn-secondary" href="<?= h($urlExport) ?>" title="Exportar consulta para CSV">Exportar CSV</a>
+            <button type="button" class="btn btn-secondary" onclick="window.print()" title="Imprimir consulta">Imprimir resultado</button>
+        </div>
+        <?php endif; ?>
     </div>
 
     <div class="card no-print">
         <form method="get" class="filters">
             <div>
-                <label for="data_ini">Data inicial</label>
-                <input type="date" id="data_ini" name="data_ini" value="<?= h($dataIni) ?>" required>
+                <label for="data">Data</label>
+                <input type="date" id="data" name="data" value="<?= h($dataIni) ?>" required>
             </div>
 
             <div>
-                <label for="data_fim">Data final</label>
-                <input type="date" id="data_fim" name="data_fim" value="<?= h($dataFim) ?>" required>
+                <label for="btn-ontem">Data rápida</label>
+                <button type="button" id="btn-ontem" class="btn-secondary" onclick="consultarOntem(this)">Ontem</button>
             </div>
 
             <div>
@@ -988,29 +1074,13 @@ $urlExport = '?' . http_build_query($queryExport);
                 <a class="btn btn-secondary" href="index.php">Limpar</a>
             </div>
 
-            <?php if ($erro === null): ?>
-                <div>
-                    <label>&nbsp;</label>
-                    <a class="btn btn-secondary" href="<?= h($urlExport) ?>">Exportar CSV</a>
-                </div>
-
-                <div>
-                    <label>&nbsp;</label>
-                    <button type="button" class="btn btn-secondary" onclick="window.print()">Imprimir resultado</button>
-                </div>
-            <?php endif; ?>
         </form>
-
-        <div class="info">
-            Usuários: somente operadores ativos. Forma de pagamento: mostra apenas registros com valor maior que zero na opção escolhida.
-            No recebimento, a forma 06 (PIX) é apresentada em BANCO; nas vendas, PIX permanece na coluna PIX.
-        </div>
     </div>
 
     <?php if ($erro === null): ?>
         <div class="print-header">
             <strong>Filtros da consulta</strong><br>
-            Período: <?= h(date('d/m/Y', strtotime($dataIni))) ?> a <?= h(date('d/m/Y', strtotime($dataFim))) ?>
+            Data: <?= h(date('d/m/Y', strtotime($dataIni))) ?>
             &nbsp;|&nbsp; Empresa: <?= h($empresa) ?>
             &nbsp;|&nbsp; Usuário: <?= h($usuarioDescricao) ?><br>
             Tipo: <?= h($tipo === '' ? 'Todos' : $tipo) ?>
@@ -1038,6 +1108,11 @@ $urlExport = '?' . http_build_query($queryExport);
 
             <div class="table-wrap">
                 <table id="tabela-caixa">
+                    <colgroup>
+                        <?php foreach ([115, 62, 100, 110, 295, 120, 105, 105, 105, 105, 100, 105, 100, 105] as $larguraColuna): ?>
+                            <col style="width: <?= (int)$larguraColuna ?>px">
+                        <?php endforeach; ?>
+                    </colgroup>
                     <thead>
                     <tr>
                         <th data-sort-type="date" aria-sort="none"><button type="button" class="sort-button" title="Ordenar por DATA" aria-label="Ordenar por DATA">DATA<span class="sort-indicator" aria-hidden="true">↕</span></button></th>
@@ -1064,7 +1139,7 @@ $urlExport = '?' . http_build_query($queryExport);
                     <?php else: ?>
                         <?php foreach ($rows as $row): ?>
                             <tr class="<?= strtolower(h($row['TIPO'])) ?>">
-                                <td><?= h((string)$row['DATA']) ?></td>
+                                <td data-date="<?= h(substr((string)$row['DATA'], 0, 10)) ?>"><?= h(dataCurta($row['DATA'])) ?></td>
                                 <td><span class="badge"><?= h($row['TIPO']) ?></span></td>
                                 <td><?= h((string)$row['CODIGO']) ?></td>
                                 <td><?= h((string)$row['CODCLIENTE']) ?></td>
@@ -1088,6 +1163,17 @@ $urlExport = '?' . http_build_query($queryExport);
     <?php endif; ?>
 </div>
 <script>
+function consultarOntem(botao) {
+    const ontem = new Date();
+    ontem.setDate(ontem.getDate() - 1);
+    const ano = ontem.getFullYear();
+    const mes = String(ontem.getMonth() + 1).padStart(2, '0');
+    const dia = String(ontem.getDate()).padStart(2, '0');
+    const formulario = botao.closest('form');
+    formulario.querySelector('#data').value = `${ano}-${mes}-${dia}`;
+    if (formulario.requestSubmit) formulario.requestSubmit();
+    else formulario.submit();
+}
 (function () {
     'use strict';
     const tabela = document.getElementById('tabela-caixa');
@@ -1104,11 +1190,69 @@ $urlExport = '?' . http_build_query($queryExport);
             return Number(texto.replace(/\./g, '').replace(',', '.')) || 0;
         }
         if (tipo === 'date') {
-            // Formato recebido do Firebird: YYYY-MM-DD HH:MM:SS.
-            return texto;
+            return linha.cells[indice].dataset.date || texto.split('-').reverse().join('-');
         }
         return texto;
     }
+
+    // O texto completo fica disponivel ao passar o mouse em celulas estreitas.
+    Array.from(corpo.rows).forEach(linha => {
+        Array.from(linha.cells).forEach(celula => {
+            if (!celula.hasAttribute('title')) celula.title = celula.textContent.trim();
+        });
+    });
+
+    // Salva os ajustes por navegador, sem modificar configuracoes do servidor.
+    const colunas = Array.from(tabela.querySelectorAll('colgroup col'));
+    const chaveLargura = 'resulth-caixa-colunas-v1';
+    const largurasPadrao = [115, 62, 100, 110, 295, 120, 105, 105, 105, 105, 100, 105, 100, 105];
+    let larguras = [...largurasPadrao];
+    try {
+        const salvas = JSON.parse(localStorage.getItem(chaveLargura));
+        if (Array.isArray(salvas) && salvas.length === colunas.length) {
+            larguras = salvas.map((valor, i) =>
+                Number.isFinite(Number(valor)) && Number(valor) >= 55 && Number(valor) <= 1200
+                    ? Number(valor) : largurasPadrao[i]
+            );
+        }
+    } catch (erro) { /* Armazenamento indisponivel: continua sem persistencia. */ }
+
+    function atualizarLarguras() {
+        colunas.forEach((col, indice) => { col.style.width = larguras[indice] + 'px'; });
+        tabela.style.width = larguras.reduce((soma, valor) => soma + valor, 0) + 'px';
+    }
+    atualizarLarguras();
+
+    cabecalhos.forEach((th, indice) => {
+        const alca = document.createElement('span');
+        alca.className = 'col-resizer';
+        alca.title = 'Arraste para ajustar a largura da coluna';
+        alca.setAttribute('aria-hidden', 'true');
+        th.appendChild(alca);
+        alca.addEventListener('pointerdown', (evento) => {
+            if (evento.button !== 0) return;
+            evento.preventDefault();
+            evento.stopPropagation();
+            alca.setPointerCapture(evento.pointerId);
+            const inicioX = evento.clientX;
+            const larguraInicial = larguras[indice];
+            document.body.classList.add('col-resizing');
+            function mover(ev) {
+                larguras[indice] = Math.max(55, Math.min(1200, larguraInicial + ev.clientX - inicioX));
+                atualizarLarguras();
+            }
+            function finalizar() {
+                document.body.classList.remove('col-resizing');
+                alca.removeEventListener('pointermove', mover);
+                alca.removeEventListener('pointerup', finalizar);
+                alca.removeEventListener('pointercancel', finalizar);
+                try { localStorage.setItem(chaveLargura, JSON.stringify(larguras)); } catch (erro) {}
+            }
+            alca.addEventListener('pointermove', mover);
+            alca.addEventListener('pointerup', finalizar);
+            alca.addEventListener('pointercancel', finalizar);
+        });
+    });
 
     cabecalhos.forEach((th, indice) => {
         const botao = th.querySelector('.sort-button');
